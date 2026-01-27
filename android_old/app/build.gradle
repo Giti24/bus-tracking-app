@@ -1,0 +1,44 @@
+plugins {
+    id "com.android.application"
+    id "org.jetbrains.kotlin.android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace "com.example.email_password_login"
+    compileSdk 34
+    ndkVersion flutter.ndkVersion
+
+    defaultConfig {
+        applicationId "com.example.email_password_login"
+        minSdkVersion flutter.minSdkVersion
+        targetSdk 34
+
+        // ✅ FIX: Use constants (your old template variables don't exist)
+        versionCode 1
+        versionName "1.0.0"
+    }
+    buildFeatures {
+        buildConfig true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+        }
+    }
+}
+
+flutter {
+    source "../.."
+}
+

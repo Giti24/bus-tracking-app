@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "395100948139",
+    "project_id": "bus-tracking-flutter-mai-f3fda",
+    "storage_bucket": "bus-tracking-flutter-mai-f3fda.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:395100948139:android:68f6101995df1550ef99ee",
+        "android_client_info": {
+          "package_name": "com.example.email_password_login"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA1cKXPDlWtgUSw4cfbwt23Y5WM_A2EqQI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
