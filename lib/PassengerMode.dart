@@ -7,6 +7,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'Simulator.dart';
 
 class PassengerMode extends StatefulWidget {
   const PassengerMode({Key? key}) : super(key: key);
@@ -33,32 +34,63 @@ class _PassengerModeState extends State<PassengerMode> {
           'name': 'Skanderbeg Square',
           'lat': 41.3275,
           'lon': 19.8187,
-          // simple mock route: a few points in Tirana
+          // longer mock route with many intermediate points and stops at 4 indices
           'route': [
-            {'lat': 41.3300, 'lon': 19.8200},
-            {'lat': 41.3290, 'lon': 19.8190},
+            {'lat': 41.3350, 'lon': 19.8240},
+            {'lat': 41.3335, 'lon': 19.8230},
+            {'lat': 41.3320, 'lon': 19.8215},
+            {'lat': 41.3305, 'lon': 19.8205},
+            {'lat': 41.3290, 'lon': 19.8195},
+            {'lat': 41.3280, 'lon': 19.8190},
             {'lat': 41.3275, 'lon': 19.8187},
+            {'lat': 41.3265, 'lon': 19.8180},
+            {'lat': 41.3250, 'lon': 19.8170},
+            {'lat': 41.3235, 'lon': 19.8160},
+            {'lat': 41.3220, 'lon': 19.8150},
+            {'lat': 41.3205, 'lon': 19.8140},
           ],
+          // stops indices (4 stops)
+          'stops': [2, 5, 8, 11],
         },
         {
           'name': 'Grand Park (Parku i Madh)',
           'lat': 41.3151,
           'lon': 19.8314,
           'route': [
-            {'lat': 41.3270, 'lon': 19.8250},
-            {'lat': 41.3220, 'lon': 19.8290},
+            {'lat': 41.3320, 'lon': 19.8270},
+            {'lat': 41.3300, 'lon': 19.8280},
+            {'lat': 41.3280, 'lon': 19.8290},
+            {'lat': 41.3260, 'lon': 19.8300},
+            {'lat': 41.3240, 'lon': 19.8305},
+            {'lat': 41.3220, 'lon': 19.8310},
+            {'lat': 41.3200, 'lon': 19.8314},
+            {'lat': 41.3180, 'lon': 19.8316},
+            {'lat': 41.3160, 'lon': 19.8315},
             {'lat': 41.3151, 'lon': 19.8314},
+            {'lat': 41.3140, 'lon': 19.8313},
+            {'lat': 41.3130, 'lon': 19.8310},
           ],
+          'stops': [1, 4, 7, 10],
         },
         {
           'name': 'Tirana International Airport',
           'lat': 41.4141,
           'lon': 19.7201,
           'route': [
-            {'lat': 41.3500, 'lon': 19.7800},
-            {'lat': 41.3800, 'lon': 19.7500},
+            {'lat': 41.3800, 'lon': 19.7700},
+            {'lat': 41.3850, 'lon': 19.7600},
+            {'lat': 41.3900, 'lon': 19.7500},
+            {'lat': 41.3950, 'lon': 19.7400},
+            {'lat': 41.4000, 'lon': 19.7300},
+            {'lat': 41.4050, 'lon': 19.7250},
+            {'lat': 41.4100, 'lon': 19.7220},
             {'lat': 41.4141, 'lon': 19.7201},
+            {'lat': 41.4170, 'lon': 19.7180},
+            {'lat': 41.4200, 'lon': 19.7160},
+            {'lat': 41.4230, 'lon': 19.7140},
+            {'lat': 41.4250, 'lon': 19.7120},
           ],
+          'stops': [0, 4, 7, 11],
         },
       ];
       String? _selectedMockName;
@@ -190,63 +222,68 @@ class _PassengerModeState extends State<PassengerMode> {
     }
 
     // Apply a chosen mock destination: draw its route, markers and store locally.
-    Future<void> _applyMockDestination(Map<String, dynamic> dest) async {
-      final name = dest['name'] as String? ?? 'Unknown';
-      final lat = (dest['lat'] as num).toDouble();
-      final lon = (dest['lon'] as num).toDouble();
+     Future<void> _applyMockDestination(Map<String, dynamic> dest) async {
+       final name = dest['name'] as String? ?? 'Unknown';
+       final lat = (dest['lat'] as num).toDouble();
+       final lon = (dest['lon'] as num).toDouble();
 
-      // build polyline points from mock route
-      final List<LatLng> points = [];
-      final route = dest['route'] as List<dynamic>? ?? [];
-      for (final p in route) {
-        final m = p as Map<String, dynamic>;
-        final rlat = (m['lat'] as num).toDouble();
-        final rlon = (m['lon'] as num).toDouble();
-        points.add(LatLng(rlat, rlon));
-      }
+       // build polyline points from mock route
+       final List<LatLng> points = [];
+       final route = dest['route'] as List<dynamic>? ?? [];
+       for (final p in route) {
+         final m = p as Map<String, dynamic>;
+         final rlat = (m['lat'] as num).toDouble();
+         final rlon = (m['lon'] as num).toDouble();
+         points.add(LatLng(rlat, rlon));
+       }
 
-      final poly = Polyline(
-        polylineId: PolylineId('mock_${name}'),
-        color: Colors.deepPurple,
-        width: 5,
-        points: points,
-      );
+       final poly = Polyline(
+         polylineId: PolylineId('mock_${name}'),
+         color: Colors.deepPurple,
+         width: 5,
+         points: points,
+       );
 
-      setState(() {
-        _polylines
-          ..clear()
-          ..add(poly);
-        _destMarker = Marker(
-          markerId: const MarkerId('dest'),
-          position: LatLng(lat, lon),
-          infoWindow: InfoWindow(title: name),
-        );
-        if (_originMarker != null) {
-          _markers.removeWhere((m) => m.markerId == _originMarker!.markerId);
-        }
-        _originMarker = Marker(
-          markerId: const MarkerId('origin'),
-          position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
-        );
-        _markers
-          ..removeWhere((m) => m.markerId == const MarkerId('dest') || m.markerId == const MarkerId('origin'))
-          ..addAll([_originMarker!, _destMarker!]);
-        _selectedMockName = name;
-        _destController.text = name;
-      });
+       setState(() {
+         _polylines
+           ..clear()
+           ..add(poly);
+         _destMarker = Marker(
+           markerId: const MarkerId('dest'),
+           position: LatLng(lat, lon),
+           infoWindow: InfoWindow(title: name),
+         );
+         if (_originMarker != null) {
+           _markers.removeWhere((m) => m.markerId == _originMarker!.markerId);
+         }
+         _originMarker = Marker(
+           markerId: const MarkerId('origin'),
+           position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+         );
+         _markers
+           ..removeWhere((m) => m.markerId == const MarkerId('dest') || m.markerId == const MarkerId('origin'))
+           ..addAll([_originMarker!, _destMarker!]);
+         _selectedMockName = name;
+         _destController.text = name;
+       });
 
-      // Save to shared preferences for Waiting page to pick up
-      final prefs = await SharedPreferences.getInstance();
-      final stored = {
-        'name': name,
-        'lat': lat,
-        'lon': lon,
-        'route': route,
-      };
-      await prefs.setString('selected_destination', json.encode(stored));
-      // show small confirmation
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Selected $name')));
-    }
+       // Save to shared preferences for Waiting page to pick up
+       final prefs = await SharedPreferences.getInstance();
+       final stored = {
+         'name': name,
+         'lat': lat,
+         'lon': lon,
+         'route': route,
+         'stops': dest['stops'] ?? [],
+       };
+       await prefs.setString('selected_destination', json.encode(stored));
+       // Auto-start simulation for this selected route (single route list)
+       try {
+         BusSimManager.startForRoutes(FirebaseDatabase.instance.ref(), [dest], tickMs: 1000, stepFraction: 0.005, stopSeconds: 30);
+       } catch (_) {}
+       // show small confirmation
+       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Selected $name')));
+     }
 
     Future<void> _fetchSuggestions(String input) async {
     // Use Nominatim search API for suggestions (no key required). Observe fair-use policy.

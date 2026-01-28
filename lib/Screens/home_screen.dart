@@ -4,9 +4,11 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
+import 'package:firebase_database/firebase_database.dart';
 
 import '../PassengerMode.dart';
 import '../WaitingMode.dart';
+import '../Simulator.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,52 +18,83 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  int _selectedIndex = 0;
-  late final PageController _pageController;
+    int _selectedIndex = 0;
+    late final PageController _pageController;
 
-  // Small mock routes (Tirana) reused in Home for Active rides
-  final List<Map<String, dynamic>> _mockDestinations = [
+    // Small mock routes (Tirana) reused in Home for Active rides
+    final List<Map<String, dynamic>> _mockDestinations = [
     {
       'name': 'Skanderbeg Square',
       'lat': 41.3275,
       'lon': 19.8187,
+      // longer mock route with many intermediate points and stops at 4 indices
       'route': [
-        {'lat': 41.3300, 'lon': 19.8200},
-        {'lat': 41.3290, 'lon': 19.8190},
+        {'lat': 41.3350, 'lon': 19.8240},
+        {'lat': 41.3335, 'lon': 19.8230},
+        {'lat': 41.3320, 'lon': 19.8215},
+        {'lat': 41.3305, 'lon': 19.8205},
+        {'lat': 41.3290, 'lon': 19.8195},
+        {'lat': 41.3280, 'lon': 19.8190},
         {'lat': 41.3275, 'lon': 19.8187},
+        {'lat': 41.3265, 'lon': 19.8180},
+        {'lat': 41.3250, 'lon': 19.8170},
+        {'lat': 41.3235, 'lon': 19.8160},
+        {'lat': 41.3220, 'lon': 19.8150},
+        {'lat': 41.3205, 'lon': 19.8140},
       ],
+      'stops': [2,5,8,11],
     },
     {
       'name': 'Grand Park (Parku i Madh)',
       'lat': 41.3151,
       'lon': 19.8314,
       'route': [
-        {'lat': 41.3270, 'lon': 19.8250},
-        {'lat': 41.3220, 'lon': 19.8290},
+        {'lat': 41.3320, 'lon': 19.8270},
+        {'lat': 41.3300, 'lon': 19.8280},
+        {'lat': 41.3280, 'lon': 19.8290},
+        {'lat': 41.3260, 'lon': 19.8300},
+        {'lat': 41.3240, 'lon': 19.8305},
+        {'lat': 41.3220, 'lon': 19.8310},
+        {'lat': 41.3200, 'lon': 19.8314},
+        {'lat': 41.3180, 'lon': 19.8316},
+        {'lat': 41.3160, 'lon': 19.8315},
         {'lat': 41.3151, 'lon': 19.8314},
+        {'lat': 41.3140, 'lon': 19.8313},
+        {'lat': 41.3130, 'lon': 19.8310},
       ],
+      'stops': [1,4,7,10],
     },
     {
       'name': 'Tirana International Airport',
       'lat': 41.4141,
       'lon': 19.7201,
       'route': [
-        {'lat': 41.3500, 'lon': 19.7800},
-        {'lat': 41.3800, 'lon': 19.7500},
+        {'lat': 41.3800, 'lon': 19.7700},
+        {'lat': 41.3850, 'lon': 19.7600},
+        {'lat': 41.3900, 'lon': 19.7500},
+        {'lat': 41.3950, 'lon': 19.7400},
+        {'lat': 41.4000, 'lon': 19.7300},
+        {'lat': 41.4050, 'lon': 19.7250},
+        {'lat': 41.4100, 'lon': 19.7220},
         {'lat': 41.4141, 'lon': 19.7201},
+        {'lat': 41.4170, 'lon': 19.7180},
+        {'lat': 41.4200, 'lon': 19.7160},
+        {'lat': 41.4230, 'lon': 19.7140},
+        {'lat': 41.4250, 'lon': 19.7120},
       ],
+      'stops': [0,4,7,11],
     },
-  ];
+    ];
 
   // TODO: replace with your real user data / auth
   final String userName = "";
   final String userEmail = "";
 
-  @override
-  void initState() {
+    @override
+    void initState() {
     super.initState();
     _pageController = PageController(initialPage: _selectedIndex);
-  }
+    }
 
   // TODO: replace with your real logout logic
   Future<void> _logout(BuildContext context) async {
@@ -343,6 +376,8 @@ class _HomeScreenState extends State<HomeScreen> {
             ],
           ),
 
+          // Simulation is started automatically when a route is selected from Active rides.
+
           const SizedBox(height: 22),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -404,6 +439,14 @@ class _HomeScreenState extends State<HomeScreen> {
                     };
                     await prefs.setString('selected_destination', json.encode(stored));
                     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Selected $name')));
+                    // Auto-start simulator for the selected route (single route list)
+                    BusSimManager.startForRoutes(
+                      FirebaseDatabase.instance.ref(),
+                      [m],
+                      tickMs: 1000,
+                      stepFraction: 0.005, // smooth, slow movement
+                      stopSeconds: 30, // 30s pause at scheduled stops
+                    );
                   },
                   child: Row(
                     children: [
@@ -552,11 +595,13 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  @override
-  void dispose() {
+    @override
+    void dispose() {
+    // stop BusSimManager if running
+    BusSimManager.stopActive();
     _pageController.dispose();
     super.dispose();
-  }
+    }
 }
 
 class _QuickActionTile extends StatelessWidget {

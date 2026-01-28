@@ -15,13 +15,17 @@ class WaitingMode extends StatefulWidget {
 class _WaitingModeState extends State<WaitingMode> {
   final DatabaseReference _databaseRef = FirebaseDatabase.instance.ref();
   final List<Marker> _markers = [];
-  GoogleMapController? _controller;
-  String? _selectedDestinationName;
-  List<LatLng>? _selectedRoutePoints;
-  double? _selectedDestinationLat;
-  double? _selectedDestinationLng;
-  // optional bounds cache for zooming when map becomes ready
-  LatLngBounds? _selectedRouteBounds;
+    GoogleMapController? _controller;
+    String? _selectedDestinationName;
+    List<LatLng>? _selectedRoutePoints;
+    double? _selectedDestinationLat;
+    double? _selectedDestinationLng;
+    // latest known position for the selected vehicle (if any)
+    double? _selectedVehicleLat;
+    double? _selectedVehicleLng;
+    String? _selectedVehicleTimestamp;
+    // optional bounds cache for zooming when map becomes ready
+    LatLngBounds? _selectedRouteBounds;
 
   @override
   void initState() {
@@ -31,6 +35,7 @@ class _WaitingModeState extends State<WaitingMode> {
   }
 
   void _listenPassengerLocations() {
+    // legacy: keep listening to root pushes (e.g., passengers), but focus on simulator/
     _databaseRef.onChildAdded.listen((event) {
       final value = event.snapshot.value;
       if (value is! Map) return;
@@ -50,6 +55,74 @@ class _WaitingModeState extends State<WaitingMode> {
           ),
         );
       });
+    });
+
+    // Live simulator: listen under 'simulator' and update per-vehicle markers on add/change
+    final simRef = _databaseRef.child('simulator');
+    simRef.onChildAdded.listen((event) {
+      final val = event.snapshot.value;
+      if (val is! Map) return;
+      final data = Map<String, dynamic>.from(val);
+      final lat = data['latitude'];
+      final lon = data['longitude'];
+      final ts = data['timestamp']?.toString();
+      final vehicle = data['vehicle']?.toString() ?? event.snapshot.key ?? 'sim';
+      if (lat is! num || lon is! num) return;
+      final markerId = MarkerId('sim_$vehicle');
+      final isSelected = (_selectedDestinationName != null && _selectedDestinationName == vehicle);
+      if (isSelected) {
+        _selectedVehicleLat = lat.toDouble();
+        _selectedVehicleLng = lon.toDouble();
+        _selectedVehicleTimestamp = ts;
+      }
+      final marker = Marker(
+        markerId: markerId,
+        position: LatLng(lat.toDouble(), lon.toDouble()),
+        infoWindow: InfoWindow(title: vehicle, snippet: ts ?? ''),
+        icon: isSelected
+            ? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure)
+            : BitmapDescriptor.defaultMarker,
+      );
+      setState(() {
+        _markers.removeWhere((m) => m.markerId == markerId);
+        _markers.add(marker);
+      });
+      // If this vehicle matches the currently selected destination, pan the map to it
+      if (isSelected && _controller != null) {
+        _controller!.animateCamera(CameraUpdate.newLatLng(LatLng(lat.toDouble(), lon.toDouble())));
+      }
+    });
+    simRef.onChildChanged.listen((event) {
+      final val = event.snapshot.value;
+      if (val is! Map) return;
+      final data = Map<String, dynamic>.from(val);
+      final lat = data['latitude'];
+      final lon = data['longitude'];
+      final ts = data['timestamp']?.toString();
+      final vehicle = data['vehicle']?.toString() ?? event.snapshot.key ?? 'sim';
+      if (lat is! num || lon is! num) return;
+      final markerId = MarkerId('sim_$vehicle');
+      final isSelected = (_selectedDestinationName != null && _selectedDestinationName == vehicle);
+      if (isSelected) {
+        _selectedVehicleLat = lat.toDouble();
+        _selectedVehicleLng = lon.toDouble();
+        _selectedVehicleTimestamp = ts;
+      }
+      final marker = Marker(
+        markerId: markerId,
+        position: LatLng(lat.toDouble(), lon.toDouble()),
+        infoWindow: InfoWindow(title: vehicle, snippet: ts ?? ''),
+        icon: isSelected
+            ? BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure)
+            : BitmapDescriptor.defaultMarker,
+      );
+      setState(() {
+        _markers.removeWhere((m) => m.markerId == markerId);
+        _markers.add(marker);
+      });
+      if (isSelected && _controller != null) {
+        _controller!.animateCamera(CameraUpdate.newLatLng(LatLng(lat.toDouble(), lon.toDouble())));
+      }
     });
   }
 
@@ -261,12 +334,31 @@ class _WaitingModeState extends State<WaitingMode> {
                                 ),
                                 if (_selectedDestinationLat != null && _selectedDestinationLng != null)
                                   Text(
-                                    "Lat: ${_selectedDestinationLat!.toStringAsFixed(5)}, Lng: ${_selectedDestinationLng!.toStringAsFixed(5)}",
+                                    "Route start: Lat: ${_selectedDestinationLat!.toStringAsFixed(5)}, Lng: ${_selectedDestinationLng!.toStringAsFixed(5)}",
                                     style: GoogleFonts.dmSans(
                                       fontSize: 11,
                                       color: muted,
                                     ),
                                   ),
+                                if (_selectedVehicleLat != null && _selectedVehicleLng != null) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    "Bus now: Lat: ${_selectedVehicleLat!.toStringAsFixed(5)}, Lng: ${_selectedVehicleLng!.toStringAsFixed(5)}",
+                                    style: GoogleFonts.dmSans(
+                                      fontSize: 12,
+                                      color: const Color(0xFF2B5EA3),
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  if (_selectedVehicleTimestamp != null)
+                                    Text(
+                                      "Updated: ${_selectedVehicleTimestamp!}",
+                                      style: GoogleFonts.dmSans(
+                                        fontSize: 11,
+                                        color: muted,
+                                      ),
+                                    ),
+                                ],
                                 if (_selectedRoutePoints != null && _selectedRoutePoints!.isNotEmpty)
                                   Text(
                                     "Route: ${_selectedRoutePoints!.length} points",
