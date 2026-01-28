@@ -3,6 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'dart:async';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class PassengerMode extends StatefulWidget {
   const PassengerMode({Key? key}) : super(key: key);
@@ -11,19 +15,102 @@ class PassengerMode extends StatefulWidget {
   _PassengerModeState createState() => _PassengerModeState();
 }
 
+
 class _PassengerModeState extends State<PassengerMode> {
   final DatabaseReference _databaseRef = FirebaseDatabase.instance.ref();
+
+    // Using OpenStreetMap Nominatim for search/geocoding and OSRM for routing.
+    // No API key required for basic usage. Note: respect Nominatim usage policy and set a proper User-Agent.
+
+      GoogleMapController? _controller;
+      final TextEditingController _destController = TextEditingController();
+      final List<Polyline> _polylines = [];
+      Marker? _originMarker;
+      Marker? _destMarker;
+      // --- Mock destinations (Tirana) ---
+      final List<Map<String, dynamic>> _mockDestinations = [
+        {
+          'name': 'Skanderbeg Square',
+          'lat': 41.3275,
+          'lon': 19.8187,
+          // simple mock route: a few points in Tirana
+          'route': [
+            {'lat': 41.3300, 'lon': 19.8200},
+            {'lat': 41.3290, 'lon': 19.8190},
+            {'lat': 41.3275, 'lon': 19.8187},
+          ],
+        },
+        {
+          'name': 'Grand Park (Parku i Madh)',
+          'lat': 41.3151,
+          'lon': 19.8314,
+          'route': [
+            {'lat': 41.3270, 'lon': 19.8250},
+            {'lat': 41.3220, 'lon': 19.8290},
+            {'lat': 41.3151, 'lon': 19.8314},
+          ],
+        },
+        {
+          'name': 'Tirana International Airport',
+          'lat': 41.4141,
+          'lon': 19.7201,
+          'route': [
+            {'lat': 41.3500, 'lon': 19.7800},
+            {'lat': 41.3800, 'lon': 19.7500},
+            {'lat': 41.4141, 'lon': 19.7201},
+          ],
+        },
+      ];
+      String? _selectedMockName;
+          // Autocomplete suggestions state
+          List<Map<String, String>> _suggestions = []; // { 'description': ..., 'place_id': ... }
+          Timer? _debounce;
+          bool _loadingSuggestions = false;
+          String? _placesStatus;
+          String? _lastApiError;
+          // lightweight in-memory cache to avoid repeated identical requests
+          final Map<String, List<Map<String, String>>> _suggestionsCache = {};
+
+      // Helper to perform HTTP GET with retries and exponential backoff
+      Future<http.Response> _httpGetWithRetries(Uri url, {Map<String,String>? headers, int retries = 2, Duration timeout = const Duration(seconds:15)}) async {
+        int attempt = 0;
+        while (true) {
+          try {
+            attempt++;
+            final resp = await http.get(url, headers: headers).timeout(timeout);
+            return resp;
+          } on TimeoutException catch (_) {
+            if (attempt > retries) rethrow;
+            // short exponential backoff
+            final backoff = Duration(milliseconds: 300 * (1 << (attempt - 1)));
+            // ignore: avoid_print
+            print('Request timeout (attempt $attempt) to $url, retrying after $backoff');
+            await Future.delayed(backoff);
+            continue;
+          } catch (e) {
+            // other network errors: if no retries left, rethrow to be handled by caller
+            if (attempt > retries) rethrow;
+            final backoff = Duration(milliseconds: 300 * (1 << (attempt - 1)));
+            // ignore: avoid_print
+            print('Request failed (attempt $attempt) to $url: $e, retrying after $backoff');
+            await Future.delayed(backoff);
+          }
+        }
+      }
 
   Position? _currentPosition;
   String? _error;
   final Set<Marker> _markers = {};
   DateTime? _lastUpdated;
 
-  @override
-  void initState() {
+    @override
+    void initState() {
     super.initState();
     _getCurrentLocation();
-  }
+    _destController.addListener(() {
+      _onDestChanged(_destController.text);
+    });
+    }
 
   Future<void> _getCurrentLocation() async {
     try {
@@ -69,6 +156,10 @@ class _PassengerModeState extends State<PassengerMode> {
               position: LatLng(position.latitude, position.longitude),
             ),
           );
+        _originMarker = Marker(
+          markerId: const MarkerId('origin'),
+          position: LatLng(position.latitude, position.longitude),
+        );
       });
 
       await _uploadLocationToDatabase(position.latitude, position.longitude);
@@ -77,14 +168,230 @@ class _PassengerModeState extends State<PassengerMode> {
     }
   }
 
-  Future<void> _uploadLocationToDatabase(
+    Future<void> _uploadLocationToDatabase(
       double latitude, double longitude) async {
     await _databaseRef.push().set({
       'latitude': latitude,
       'longitude': longitude,
       'timestamp': DateTime.now().toIso8601String(),
     });
-  }
+    }
+
+    // --- Autocomplete & routing helpers ---
+    void _onDestChanged(String text) {
+    _debounce?.cancel();
+    if (text.trim().isEmpty) {
+      setState(() => _suggestions = []);
+      return;
+    }
+    _debounce = Timer(const Duration(milliseconds: 400), () {
+      _fetchSuggestions(text.trim());
+    });
+    }
+
+    // Apply a chosen mock destination: draw its route, markers and store locally.
+    Future<void> _applyMockDestination(Map<String, dynamic> dest) async {
+      final name = dest['name'] as String? ?? 'Unknown';
+      final lat = (dest['lat'] as num).toDouble();
+      final lon = (dest['lon'] as num).toDouble();
+
+      // build polyline points from mock route
+      final List<LatLng> points = [];
+      final route = dest['route'] as List<dynamic>? ?? [];
+      for (final p in route) {
+        final m = p as Map<String, dynamic>;
+        final rlat = (m['lat'] as num).toDouble();
+        final rlon = (m['lon'] as num).toDouble();
+        points.add(LatLng(rlat, rlon));
+      }
+
+      final poly = Polyline(
+        polylineId: PolylineId('mock_${name}'),
+        color: Colors.deepPurple,
+        width: 5,
+        points: points,
+      );
+
+      setState(() {
+        _polylines
+          ..clear()
+          ..add(poly);
+        _destMarker = Marker(
+          markerId: const MarkerId('dest'),
+          position: LatLng(lat, lon),
+          infoWindow: InfoWindow(title: name),
+        );
+        if (_originMarker != null) {
+          _markers.removeWhere((m) => m.markerId == _originMarker!.markerId);
+        }
+        _originMarker = Marker(
+          markerId: const MarkerId('origin'),
+          position: LatLng(_currentPosition!.latitude, _currentPosition!.longitude),
+        );
+        _markers
+          ..removeWhere((m) => m.markerId == const MarkerId('dest') || m.markerId == const MarkerId('origin'))
+          ..addAll([_originMarker!, _destMarker!]);
+        _selectedMockName = name;
+        _destController.text = name;
+      });
+
+      // Save to shared preferences for Waiting page to pick up
+      final prefs = await SharedPreferences.getInstance();
+      final stored = {
+        'name': name,
+        'lat': lat,
+        'lon': lon,
+        'route': route,
+      };
+      await prefs.setString('selected_destination', json.encode(stored));
+      // show small confirmation
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Selected $name')));
+    }
+
+    Future<void> _fetchSuggestions(String input) async {
+    // Use Nominatim search API for suggestions (no key required). Observe fair-use policy.
+    setState(() => _loadingSuggestions = true);
+    // Serve from cache for exact queries
+    if (_suggestionsCache.containsKey(input)) {
+      setState(() {
+        _suggestions = _suggestionsCache[input]!;
+        _placesStatus = 'OK_CACHED';
+        _lastApiError = null;
+        _loadingSuggestions = false;
+      });
+      return;
+    }
+    try {
+      final url = Uri.parse('https://nominatim.openstreetmap.org/search?format=jsonv2&q=${Uri.encodeComponent(input)}&addressdetails=1&limit=6');
+      final resp = await _httpGetWithRetries(url, headers: {'User-Agent': 'bus-tracking-app/1.0 (you@example.com)'}, retries: 2, timeout: const Duration(seconds: 15));
+      // debug log
+      // ignore: avoid_print
+      print('Nominatim search response: ${resp.statusCode} ${resp.body}');
+      if (resp.statusCode != 200) {
+        setState(() {
+          _suggestions = [];
+          _placesStatus = 'NOMINATIM_ERROR';
+          _lastApiError = 'HTTP ${resp.statusCode}';
+        });
+        return;
+      }
+      final List<dynamic> items = json.decode(resp.body) as List<dynamic>;
+      if (items.isEmpty) {
+        setState(() {
+          _suggestions = [];
+          _placesStatus = 'ZERO_RESULTS';
+          _lastApiError = null;
+        });
+        return;
+      }
+      setState(() {
+        _suggestions = items.map((it) {
+          final m = it as Map<String, dynamic>;
+          return <String, String>{
+            'description': (m['display_name'] ?? '').toString(),
+            'lat': (m['lat'] ?? '').toString(),
+            'lon': (m['lon'] ?? '').toString(),
+          };
+        }).toList();
+        // cache the results for this input
+        _suggestionsCache[input] = List<Map<String,String>>.from(_suggestions);
+        _placesStatus = 'OK_NOMINATIM';
+        _lastApiError = null;
+      });
+    } catch (e) {
+      // network or parse error
+      // ignore: avoid_print
+      print('Nominatim fetch error: $e');
+      // surface friendly message for timeout-like errors
+      final msg = e is TimeoutException ? 'Timeout waiting for search service' : e.toString();
+      setState(() {
+        _suggestions = [];
+        _placesStatus = 'ERROR';
+        _lastApiError = msg;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    } finally {
+      setState(() => _loadingSuggestions = false);
+    }
+    }
+
+      Future<void> _selectSuggestion(Map<String, String> s) async {
+        final desc = s['description'] ?? '';
+        final lat = double.tryParse(s['lat'] ?? '');
+        final lon = double.tryParse(s['lon'] ?? '');
+        _destController.text = desc;
+        setState(() => _suggestions = []);
+        if (lat != null && lon != null) {
+          await _routeToCoordinates(lat, lon, desc);
+        } else {
+          await _searchAndRoute();
+        }
+      }
+
+    Future<void> _routeToCoordinates(double destLat, double destLng, String destLabel) async {
+    final origin = _currentPosition;
+    if (origin == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Current location not available')));
+      return;
+    }
+    try {
+      // Use OSRM public routing server for free routing (profile: driving)
+      final coords = '${origin.longitude},${origin.latitude};$destLng,$destLat';
+      final osrmUrl = Uri.parse('https://router.project-osrm.org/route/v1/driving/$coords?overview=full&geometries=polyline');
+      final dirResp = await _httpGetWithRetries(osrmUrl, retries: 2, timeout: const Duration(seconds: 15));
+      // debug
+      // ignore: avoid_print
+      print('OSRM route response: ${dirResp.statusCode} ${dirResp.body}');
+      if (dirResp.statusCode != 200) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Routing service unavailable')));
+        return;
+      }
+      final dirJson = json.decode(dirResp.body) as Map<String, dynamic>;
+      final routes = (dirJson['routes'] as List?) ?? [];
+      if (routes.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No route found')));
+        return;
+      }
+      final overviewPolyline = (routes[0]['geometry'] ?? '') as String;
+      final points = _decodePolyline(overviewPolyline);
+      final poly = Polyline(
+        polylineId: const PolylineId('route'),
+        color: Colors.blue,
+        width: 5,
+        points: points,
+      );
+      setState(() {
+        _polylines
+          ..clear()
+          ..add(poly);
+        _destMarker = Marker(
+          markerId: const MarkerId('dest'),
+          position: LatLng(destLat, destLng),
+          infoWindow: InfoWindow(title: destLabel),
+        );
+        _originMarker = Marker(
+          markerId: const MarkerId('origin'),
+          position: LatLng(origin.latitude, origin.longitude),
+        );
+        _markers
+          ..removeWhere((m) => m.markerId == const MarkerId('dest') || m.markerId == const MarkerId('origin'))
+          ..addAll([_originMarker!, _destMarker!]);
+      });
+      if (_controller != null && points.isNotEmpty) {
+        final swLat = points.map((p) => p.latitude).reduce((a, b) => a < b ? a : b);
+        final swLng = points.map((p) => p.longitude).reduce((a, b) => a < b ? a : b);
+        final neLat = points.map((p) => p.latitude).reduce((a, b) => a > b ? a : b);
+        final neLng = points.map((p) => p.longitude).reduce((a, b) => a > b ? a : b);
+        final bounds = LatLngBounds(southwest: LatLng(swLat, swLng), northeast: LatLng(neLat, neLng));
+        final camUpdate = CameraUpdate.newLatLngBounds(bounds, 60);
+        _controller!.moveCamera(camUpdate);
+      }
+    } catch (e) {
+      final msg = e is TimeoutException ? 'Timeout waiting for routing service' : e.toString();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Routing failed: $msg')));
+      setState(() => _lastApiError = msg);
+    }
+    }
 
   @override
   Widget build(BuildContext context) {
@@ -140,6 +447,8 @@ class _PassengerModeState extends State<PassengerMode> {
               markers: _markers,
               myLocationEnabled: true,
               myLocationButtonEnabled: false,
+              polylines: Set<Polyline>.of(_polylines),
+              onMapCreated: (c) => _controller = c,
             ),
           ),
           SafeArea(
@@ -147,88 +456,200 @@ class _PassengerModeState extends State<PassengerMode> {
               padding: const EdgeInsets.all(16),
               child: Column(
                 children: [
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 14,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFCF9F5).withOpacity(0.96),
-                      borderRadius: BorderRadius.circular(20),
-                      boxShadow: const [
-                        BoxShadow(
-                          color: Color(0x1A000000),
-                          blurRadius: 14,
-                          offset: Offset(0, 8),
-                        )
-                      ],
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          height: 40,
-                          width: 40,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF2D9C9),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: const Icon(
-                            Icons.directions_bus_filled_rounded,
-                            color: Color(0xFFB85A2B),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
+                  // Make top content scrollable so the overlay never overflows
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          // Destination search + suggestions dropdown
+                          Column(
                             children: [
-                              Text(
-                                "Passenger Mode",
-                                style: GoogleFonts.spaceGrotesk(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w700,
-                                  color: ink,
-                                ),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: DropdownButtonFormField<String?>(
+                                      value: _selectedMockName,
+                                      hint: const Text('Select destination'),
+                                      items: _mockDestinations.map((d) => DropdownMenuItem<String?>(
+                                        value: d['name'] as String,
+                                        child: Text(d['name'] as String),
+                                      )).toList(),
+                                      onChanged: (v) {
+                                        setState(() {
+                                          _selectedMockName = v;
+                                          _destController.text = v ?? '';
+                                        });
+                                      },
+                                      decoration: const InputDecoration(
+                                        filled: true,
+                                        fillColor: Colors.white,
+                                        border: OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
+                                        isDense: true,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  ElevatedButton(
+                                    onPressed: () {
+                                      if (_selectedMockName != null) {
+                                        final dest = _mockDestinations.firstWhere((d) => d['name'] == _selectedMockName);
+                                        _applyMockDestination(dest);
+                                      } else {
+                                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please select a destination')));
+                                      }
+                                    },
+                                    child: const Text('Go'),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(height: 2),
-                              Text(
-                                "Sharing your live position",
-                                style: GoogleFonts.dmSans(
-                                  fontSize: 12,
-                                  color: muted,
+                              // Suggestions list
+                              if (_suggestions.isNotEmpty || _loadingSuggestions) ...[
+                                const SizedBox(height: 8),
+                                Container(
+                                  constraints: const BoxConstraints(maxHeight: 200),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.circular(8),
+                                    boxShadow: const [BoxShadow(color: Color(0x12000000), blurRadius: 8, offset: Offset(0,4))],
+                                  ),
+                                  child: _loadingSuggestions
+                                      ? const Padding(
+                                          padding: EdgeInsets.all(12.0),
+                                          child: Center(child: SizedBox(height:16,width:16,child:CircularProgressIndicator(strokeWidth:2))),
+                                        )
+                                      : ListView.separated(
+                                          shrinkWrap: true,
+                                          padding: const EdgeInsets.all(8),
+                                          itemCount: _suggestions.length,
+                                          separatorBuilder: (_, __) => const Divider(height: 8),
+                                          itemBuilder: (context, i) {
+                                            final s = _suggestions[i];
+                                            return ListTile(
+                                              dense: true,
+                                              title: Text(s['description'] ?? ''),
+                                              onTap: () => _selectSuggestion(s),
+                                            );
+                                          },
+                                        ),
                                 ),
-                              ),
+                              ],
+                              // If no suggestions and not loading, show status to help debugging
+                              if (!_loadingSuggestions && _suggestions.isEmpty && _destController.text.trim().isNotEmpty) ...[
+                                const SizedBox(height: 6),
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    _placesStatus != null
+                                        ? 'Places: ${_placesStatus}'
+                                        : (_lastApiError != null ? 'Error: $_lastApiError' : 'No suggestions'),
+                                    style: GoogleFonts.dmSans(fontSize: 12, color: const Color(0xFF6F665D)),
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 12),
+                              // Mock destinations dropdown (Tirana) and select button
+                              // (Removed: now handled by the main destination dropdown above)
                             ],
                           ),
-                        ),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFE6F2FF),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                            "ACTIVE",
-                            style: GoogleFonts.spaceGrotesk(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                              color: const Color(0xFF2B5EA3),
-                              letterSpacing: 0.6,
+                          const SizedBox(height: 12),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 14,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Color.fromRGBO(252, 249, 245, 0.96),
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: const [
+                                BoxShadow(
+                                  color: Color(0x1A000000),
+                                  blurRadius: 14,
+                                  offset: Offset(0, 8),
+                                )
+                              ],
+                            ),
+                            child: Row(
+                              children: [
+                                Container(
+                                  height: 40,
+                                  width: 40,
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFF2D9C9),
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: const Icon(
+                                    Icons.directions_bus_filled_rounded,
+                                    color: Color(0xFFB85A2B),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        "Passenger Mode",
+                                        style: GoogleFonts.spaceGrotesk(
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.w700,
+                                          color: ink,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        "Sharing your live position",
+                                        style: GoogleFonts.dmSans(
+                                          fontSize: 12,
+                                          color: muted,
+                                        ),
+                                      ),
+                                      // Coordinates display in header
+                                      if (position != null) ...[
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          "Lat: ${position.latitude.toStringAsFixed(5)}, Lng: ${position.longitude.toStringAsFixed(5)}",
+                                          style: GoogleFonts.dmSans(
+                                            fontSize: 11,
+                                            color: muted,
+                                          ),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                ),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 6,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFFE6F2FF),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    "ACTIVE",
+                                    style: GoogleFonts.spaceGrotesk(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                      color: const Color(0xFF2B5EA3),
+                                      letterSpacing: 0.6,
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
-                  const Spacer(),
+                  // Bottom info panel (fixed below scroll area)
                   Container(
                     margin: const EdgeInsets.only(bottom: 68),
                     padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFFCF9F5).withOpacity(0.98),
+                      color: Color.fromRGBO(252, 249, 245, 0.98),
                       borderRadius: BorderRadius.circular(20),
                       boxShadow: const [
                         BoxShadow(
@@ -277,6 +698,14 @@ class _PassengerModeState extends State<PassengerMode> {
                             ),
                           ),
                         ],
+                        // Show API error message if present to help debugging
+                        if (_lastApiError != null) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            'API: $_lastApiError',
+                            style: GoogleFonts.dmSans(fontSize: 12, color: Colors.redAccent),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -297,6 +726,87 @@ class _PassengerModeState extends State<PassengerMode> {
       ),
     );
   }
+
+      Future<void> _searchAndRoute() async {
+        final destText = _destController.text.trim();
+        if (destText.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Please enter a destination')));
+          return;
+        }
+
+        final origin = _currentPosition;
+        if (origin == null) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Current location not available')));
+          return;
+        }
+
+        setState(() => _loadingSuggestions = true);
+        try {
+          // Use Nominatim to geocode the typed destination
+          final url = Uri.parse('https://nominatim.openstreetmap.org/search?format=jsonv2&q=${Uri.encodeComponent(destText)}&limit=1');
+          final resp = await _httpGetWithRetries(url, headers: {'User-Agent': 'bus-tracking-app/1.0 (you@example.com)'}, retries: 2, timeout: const Duration(seconds: 15));
+          if (resp.statusCode != 200) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Search service unavailable')));
+            return;
+          }
+          final List<dynamic> results = json.decode(resp.body) as List<dynamic>;
+          if (results.isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Destination not found')));
+            return;
+          }
+          final place = results[0] as Map<String, dynamic>;
+          final destLat = double.tryParse((place['lat'] ?? '').toString());
+          final destLng = double.tryParse((place['lon'] ?? '').toString());
+          if (destLat == null || destLng == null) {
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid place coordinates')));
+            return;
+          }
+          await _routeToCoordinates(destLat, destLng, place['display_name'] ?? destText);
+        } catch (e) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Routing failed: ${e.toString()}')));
+        } finally {
+          setState(() => _loadingSuggestions = false);
+        }
+      }
+
+  List<LatLng> _decodePolyline(String encoded) {
+    final List<LatLng> poly = [];
+    int index = 0, len = encoded.length;
+    int lat = 0, lng = 0;
+
+    while (index < len) {
+      int b, shift = 0, result = 0;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlat = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lat += dlat;
+
+      shift = 0;
+      result = 0;
+      do {
+        b = encoded.codeUnitAt(index++) - 63;
+        result |= (b & 0x1f) << shift;
+        shift += 5;
+      } while (b >= 0x20);
+      int dlng = ((result & 1) != 0 ? ~(result >> 1) : (result >> 1));
+      lng += dlng;
+
+      final point = LatLng(lat / 1e5, lng / 1e5);
+      poly.add(point);
+    }
+    return poly;
+  }
+
+    @override
+    void dispose() {
+    _controller?.dispose();
+    _destController.dispose();
+    _debounce?.cancel();
+    super.dispose();
+    }
 }
 
 class _CoordTile extends StatelessWidget {
@@ -347,7 +857,7 @@ class _StatusScaffold extends StatelessWidget {
 
   final String title;
   final String message;
-  final VoidCallback onRetry;
+  final Future<void> Function() onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -401,7 +911,20 @@ class _StatusScaffold extends StatelessWidget {
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  onPressed: onRetry,
+                  onPressed: () async {
+                    try {
+                      // optional small feedback while retrying
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Retrying...')),
+                      );
+                      await onRetry();
+                    } catch (e) {
+                      // show error if retry fails
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Retry failed: ${e.toString()}')),
+                      );
+                    }
+                  },
                   icon: const Icon(Icons.refresh_rounded),
                   label: Text(
                     "Try again",
